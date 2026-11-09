@@ -1,0 +1,235 @@
+---
+title: "FinalProjectCode"
+output: html_notebook
+---
+
+# ==============================================================================
+# BENG 183 Final Project
+# scRNA-seq + CRISPR guide capture analysis of A375 melanoma cells (RAB1A vs non-targeting control) with Seurat v5
+#
+# HOW TO RUN
+#   1. Create the folder structure (see below) and open BENG183_project.Rproj so RStudio sets the working directory to the project root.
+#   2. Open this file and run it top to bottom (Ctrl/Cmd + Enter, or Source).
+#
+#   BENG183_project/
+#   |-- BENG183_project.Rproj
+#   |-- data/
+#   |   |-- <...>_filtered_feature_bc_matrix.h5
+#   |   `-- crispr_analysis/protospacer_calls_per_cell.csv
+#   |-- scripts/analysis.R      <- this file
+#   `-- results/                <- created automatically
+# ==============================================================================
+
+# ---- 0. Packages -------------------------------------------------------------
+```{r}
+pkgs <- c("Seurat", "hdf5r", "ggplot2", "ggrepel", "patchwork", "dplyr")
+missing_pkgs <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(missing_pkgs) > 0) install.packages(missing_pkgs)
+
+library(Seurat)
+library(SeuratObject)
+library(hdf5r)
+library(ggplot2)
+library(ggrepel)
+library(patchwork)
+library(dplyr)
+
+packageVersion("Seurat")   # the original run used 5.3.1
+set.seed(183)
+dir.create("results", showWarnings = FALSE)
+```
+
+# ---- 1. Locate input files ---------------------------------------------------
+```{r}
+base <- "C:/Users/ninam/Documents/Bioinformatics/BENG183_FinalProject/BENG183_project"
+setwd(base)
+h5_file     <- normalizePath(list.files(file.path(base, "data"),
+                 pattern = "filtered_feature_bc_matrix\\.h5$", recursive = TRUE, full.names = TRUE))
+crispr_file <- normalizePath(list.files(file.path(base, "data"),
+                 pattern = "protospacer_calls_per_cell\\.csv$", recursive = TRUE, full.names = TRUE))
+stopifnot(file.exists(h5_file), file.exists(crispr_file))
+
+
+```
+
+# ---- 2. Load counts and build the Seurat object ------------------------------
+```{r}
+counts <- Read10X_h5(h5_file)
+str(counts, max.level = 1)   # should list "Gene Expression" and "CRISPR Guide Capture"
+
+a375 <- CreateSeuratObject(
+  counts       = counts[["Gene Expression"]],
+  project      = "A375_CRISPR",
+  min.cells    = 3,
+  min.features = 200
+)
+print(a375)                  # expect ~22,238 features x 1,163 cells
+```
+
+# ---- 3. Add CRISPR guide assignments as metadata -----------------------------
+```{r}
+crispr_data <- read.csv(crispr_file, row.names = 1, stringsAsFactors = FALSE)
+rownames(crispr_data) <- trimws(rownames(crispr_data))
+head(crispr_data)
+
+# match() by barcode (safer than crispr_data[colnames(a375), ], which creates
+# NA rows for cells that have no guide call)
+idx <- match(colnames(a375), rownames(crispr_data))
+
+a375$num_features <- crispr_data$num_features[idx]
+a375$feature_call <- crispr_data$feature_call[idx]
+# Cells with two guides have values like "4847|3", which become NA here (expected)
+a375$num_umis     <- suppressWarnings(as.numeric(crispr_data$num_umis[idx]))
+
+a375$feature_call[is.na(a375$feature_call)] <- "Unknown"
+table(a375$feature_call)     # RAB1A-2, Non_Target-1_MS, Non_Target-1_MS|RAB1A-2, Unknown
+```
+
+# ---- 4. Standard preprocessing, clustering, UMAP -----------------------------
+```{r}
+a375 <- NormalizeData(a375)
+a375 <- FindVariableFeatures(a375)
+a375 <- ScaleData(a375)
+a375 <- RunPCA(a375, npcs = 30)
+
+a375 <- FindNeighbors(a375, dims = 1:20)
+a375 <- FindClusters(a375, resolution = 0.5)   # ~7 clusters in the original run
+a375 <- RunUMAP(a375, dims = 1:20)
+```
+
+# ---- 5. UMAP plots -----------------------------------------------------------
+```{r}
+p_ncount   <- FeaturePlot(a375, features = "nCount_RNA", reduction = "umap")
+p_clusters <- DimPlot(a375, group.by = "seurat_clusters", reduction = "umap")
+p_guides   <- DimPlot(a375, group.by = "feature_call", reduction = "umap")
+p_numis    <- FeaturePlot(a375, features = "num_umis", reduction = "umap")
+
+print(p_ncount); print(p_clusters); print(p_guides); print(p_numis)
+
+ggsave(file.path(base, "results", "umap_nCount_RNA.png"), p_ncount, width = 6, height = 5, dpi = 300)
+ggsave(file.path(base, "results", "umap_clusters.png"), p_clusters, width = 6, height = 5, dpi = 300)
+ggsave(file.path(base, "results", "umap_feature_call.png"), p_guides, width = 7, height = 5, dpi = 300)
+ggsave(file.path(base, "results", "umap_num_umis.png"), p_numis, width = 6, height = 5, dpi = 300)1
+```
+
+# ---- 6. Pseudobulk aggregation + scatter plot --------------------------------
+```{r}
+genes.to.label <- c("GAGE2A", "RAB1A", "TMPRSS15", "RPLP0", "RPSA", "SERPINE2")
+
+agg <- AggregateExpression(a375, group.by = "feature_call", return.seurat = TRUE)
+DefaultAssay(agg) <- "RNA"
+Cells(agg)
+# NOTE: AggregateExpression turns underscores into dashes, so the group names are
+# "RAB1A-2" and "Non-Target-1-MS". Using "Non_Target-1_MS" here caused the
+# "Too few variables passed" error in the original code.
+
+p1 <- CellScatter(agg, "RAB1A-2", "Non-Target-1-MS", highlight = genes.to.label)
+p2 <- LabelPoints(plot = p1, points = genes.to.label, repel = TRUE)
+p_scatter <- p1 + p2
+print(p_scatter)
+ggsave(file.path(base, "results", "pseudobulk_scatter.png"), p_scatter, width = 10, height = 5, dpi = 300)
+```
+
+# ---- 7. Differential expression (Wilcoxon) -----------------------------------
+```{r}
+# Ident names keep their original underscores here (this is the Seurat object,
+# not the aggregated one).
+Idents(a375) <- "feature_call"
+
+# Main comparison: RAB1A-2 vs non-targeting control
+de_RAB1A_vs_NT <- FindMarkers(
+  a375,
+  ident.1 = "RAB1A-2", ident.2 = "Non_Target-1_MS",
+  logfc.threshold = 0, min.pct = 0.1
+)
+head(de_RAB1A_vs_NT, 10)
+write.csv(de_RAB1A_vs_NT, file.path(base, "results", "DE_RAB1A_vs_NonTarget.csv"))
+
+# Extra comparisons against the double-guide cells (from the original notebook)
+de_RAB1A_vs_dbl <- FindMarkers(a375, ident.1 = "RAB1A-2",
+                               ident.2 = "Non_Target-1_MS|RAB1A-2")
+de_NT_vs_dbl    <- FindMarkers(a375, ident.1 = "Non_Target-1_MS",
+                               ident.2 = "Non_Target-1_MS|RAB1A-2")
+head(de_RAB1A_vs_dbl)
+head(de_NT_vs_dbl)
+```
+
+# ---- 8. Volcano plot ---------------------------------------------------------
+```{r}
+# The columns the original volcano code expected (log10_pval, significant, label)
+# were never defined in the PDF, so they are built here.
+de <- de_RAB1A_vs_NT
+de$gene       <- rownames(de)
+de$log10_pval <- -log10(pmax(de$p_val_adj, 1e-300))
+de$significant <- ifelse(de$p_val_adj < 0.05 & abs(de$avg_log2FC) > 1, "Yes", "No")
+de$label      <- ifelse(de$gene %in% genes.to.label, de$gene, "")
+
+volcano <- ggplot(de, aes(x = avg_log2FC, y = log10_pval,
+                          color = significant, label = label)) +
+  geom_point(alpha = .5, size = 3) +
+  scale_color_manual(values = c("red", "blue")) +   # No = red, Yes = blue
+  geom_text_repel(show.legend = FALSE) +
+  theme_minimal(base_size = 12) +
+  xlab("Log2 Fold Change") + ylab("-Log10 P-value") +
+  ggtitle("Volcano Plot: RAB1A-2 vs Non_Target-1_MS")
+
+print(volcano)
+ggsave(file.path(base, "results", "volcano_RAB1A_vs_NT.png"), volcano, width = 7, height = 6, dpi = 300)
+```
+
+# ---- 9. Marker gene feature plots --------------------------------------------
+```{r}
+p_markers <- FeaturePlot(a375, features = genes.to.label,
+                         reduction = "umap", cols = c("grey", "red"))
+print(p_markers)
+ggsave(file.path(base, "results", "featureplot_markers.png"), p_markers, width = 9, height = 10, dpi = 300)
+```
+
+# ---- 10. OPTIONAL: Seurat v5 CCA integration (from the handout) --------------
+```{r}
+# Off by default, because the original notebook's numbers (7 clusters, modularity
+# 0.8187) come from the un-integrated analysis above. Set to TRUE to try it.
+# Not tested against this dataset. FindConservedMarkers also needs the 'metap'
+# package, and will error if a cluster has too few cells in one condition.
+RUN_INTEGRATION <- FALSE
+
+if (RUN_INTEGRATION) {
+  if (!"metap" %in% rownames(installed.packages())) install.packages("metap")
+
+  a375_int <- subset(a375, subset = feature_call %in% c("RAB1A-2", "Non_Target-1_MS"))
+  a375_int[["RNA"]] <- split(a375_int[["RNA"]], f = a375_int$feature_call)
+
+  a375_int <- NormalizeData(a375_int)
+  a375_int <- FindVariableFeatures(a375_int)
+  a375_int <- ScaleData(a375_int)
+  a375_int <- RunPCA(a375_int, npcs = 30)
+
+  a375_int <- IntegrateLayers(
+    object = a375_int, method = CCAIntegration,
+    new.reduction = "integrated.cca", verbose = FALSE
+  )
+  a375_int[["RNA"]] <- JoinLayers(a375_int[["RNA"]])
+
+  a375_int <- FindNeighbors(a375_int, reduction = "integrated.cca", dims = 1:20)
+  a375_int <- FindClusters(a375_int, resolution = 0.5)
+  a375_int <- RunUMAP(a375_int, reduction = "integrated.cca", dims = 1:20,
+                      reduction.name = "umap.cca")
+
+  p_int <- DimPlot(a375_int, reduction = "umap.cca",
+                   group.by = c("feature_call", "seurat_clusters"))
+  print(p_int)
+  ggsave("results/umap_integrated_cca.png", p_int, width = 12, height = 5, dpi = 300)
+
+  Idents(a375_int) <- "seurat_clusters"
+  conserved_c0 <- FindConservedMarkers(a375_int, ident.1 = 0,
+                                       grouping.var = "feature_call")
+  head(conserved_c0)
+}
+```
+
+# ---- 11. Save object + session info ------------------------------------------
+```{r}
+saveRDS(a375, file.path(base, "results", "a375_seurat_object.rds"))
+sessionInfo()
+```
+
